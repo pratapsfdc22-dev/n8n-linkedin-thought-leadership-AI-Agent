@@ -1,0 +1,865 @@
+{
+  "name": "LinkedIn+GPT",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "daysInterval": 3,
+              "triggerAtHour": 17
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        112,
+        -912
+      ],
+      "id": "8c2fe2ae-0679-4d04-9601-f7d06eaec4ef",
+      "name": "Schedule Trigger"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "gpt-5",
+          "mode": "list",
+          "cachedResultName": "gpt-5"
+        },
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.2,
+      "position": [
+        416,
+        -688
+      ],
+      "id": "349b9c12-b0ba-44ab-a8c5-6d10d698b043",
+      "name": "OpenAI Chat Model",
+      "credentials": {
+        "openAiApi": {
+          "id": "AAitTsRFwuKWqIcg",
+          "name": "OpenAi account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// INPUT ASSUMPTION: the LLM post is in $json.post (adjust if your field is different)\nconst text =\n  $json.post ||\n  $json.llm_output ||\n  $json.text ||\n  Object.values($json)[0];\n\nif (!text) {\n  return [{ json: { error: \"No post text found. Ensure LLM output goes to `post`.\" } }];\n}\n\n// Grab only the Sources block\nconst sourcesBlock = (text.split(\"Sources:\")[1] || \"\").split(\"Hashtags:\")[0] || \"\";\n\n// Parse lines that look like:\n// - Title — https://domain/path\n// - https://domain/path\nconst lines = sourcesBlock\n  .split(\"\\n\")\n  .map(l => l.trim())\n  .filter(l => l.startsWith(\"- \"));\n\nconst deny = new Set([\n  \"lnkd.in\",\"bit.ly\",\"t.co\",\"tinyurl.com\",\"ow.ly\",\"rebrand.ly\",\"buff.ly\",\"goo.gl\",\"shorturl.at\",\"cutt.ly\"\n]);\n\nconst items = [];\nconst seen = new Set();\n\nfor (const line of lines) {\n  // capture title and URL if present\n  let m = line.match(/-\\s*(.+?)\\s+—\\s+(https?:\\/\\/\\S+)/i) || line.match(/-\\s*(https?:\\/\\/\\S+)/i);\n  if (!m) continue;\n\n  let title, url;\n  if (m.length === 3) { title = m[1]; url = m[2]; }\n  else { title = \"\"; url = m[1]; }\n\n  // tidy trailing punctuation\n  url = url.replace(/[)\\]>.,;:]+$/, \"\");\n\n  // Basic URL hygiene / canonicalization\n  try {\n    const u = new URL(url);\n    const host = u.hostname.replace(/^www\\./, \"\");\n    if (u.protocol !== \"https:\") {\n      items.push({ url, title, reason: \"non-https\", valid: false, post: text });\n      continue;\n    }\n    if (deny.has(host)) {\n      items.push({ url, title, reason: \"shortener\", valid: false, post: text });\n      continue;\n    }\n    // Strip trackers\n    const drop = [\"utm_\", \"gclid\", \"fbclid\", \"mc_cid\", \"mc_eid\", \"igshid\"];\n    for (const [k] of [...u.searchParams]) if (drop.some(p => k.startsWith(p))) u.searchParams.delete(k);\n    url = u.origin + u.pathname + (u.search ? \"?\" + u.searchParams.toString() : \"\") + (u.hash || \"\");\n  } catch (e) {\n    items.push({ url, title, reason: \"bad-url\", valid: false, post: text });\n    continue;\n  }\n\n  const key = `${title}||${url}`;\n  if (seen.has(key)) continue;\n  seen.add(key);\n\n  items.push({ url, title, post: text });\n}\n\n// Emit one item per URL (keeps original post on each item)\nreturn items.length\n  ? items.map(i => ({ json: i }))\n  : [{ json: { warning: \"No sources parsed. Ensure LLM outputs a 'Sources:' section.\", post: text } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        912,
+        -912
+      ],
+      "id": "73bc833d-fb97-4816-825b-17084511b1c7",
+      "name": "Extract & Sanitize Sources"
+    },
+    {
+      "parameters": {
+        "method": "HEAD",
+        "url": "={{$json.url}}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "text/html,application/pdf"
+            }
+          ]
+        },
+        "options": {
+          "redirect": {
+            "redirect": {
+              "followRedirects": false
+            }
+          },
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "text"
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1136,
+        -912
+      ],
+      "id": "88eae9b7-b940-4e84-a2a0-af557bff4c1e",
+      "name": "Validate URL",
+      "retryOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Assemble Final Post (with shortener hard-ban + humanized output)\n// Use this exact code in BOTH:\n//   - \"Assemble Final Post\"\n//   - \"Assemble Final Post (repair)\"\n\n// -------- 0) Collect inputs --------\nconst items = $input.all().map(i => i.json);\nif (!items.length) {\n  return [{\n    json: {\n      final_post: \"\",\n      human_post: \"\",\n      total_links: 0,\n      valid_links: 0,\n      invalid_links: 0,\n      warning: \"No items received by Assemble node.\"\n    }\n  }];\n}\n\n// The original structured post text (carried forward on each item)\nlet post = items[0]?.post || \"\";\n\n// -------- 1) Validate + select GOOD links --------\n// Hard-ban common shorteners regardless of HTTP status.\nconst banned = new Set([\n  \"lnkd.in\",\"bit.ly\",\"t.co\",\"tinyurl.com\",\"ow.ly\",\n  \"rebrand.ly\",\"buff.ly\",\"goo.gl\",\"shorturl.at\",\"cutt.ly\"\n]);\n\nconst good = items.filter(i => {\n  try {\n    const urlStr = String(i.url || \"\");\n    const u = new URL(urlStr);\n    const host = u.hostname.replace(/^www\\./, \"\");\n    if (banned.has(host)) return false; // hard-ban shorteners\n\n    const sc = Number(i.statusCode);\n    const ct = String(i.headers?.[\"content-type\"] || i.headers?.[\"Content-Type\"] || \"\").toLowerCase();\n\n    // Accept only direct, public pages (200 OK + html/pdf)\n    const typeOK = ct.includes(\"text/html\") || ct.includes(\"application/pdf\");\n    return sc === 200 && typeOK;\n  } catch {\n    return false;\n  }\n});\n\n// -------- 2) Rebuild the Sources block from GOOD links only --------\nconst sourcesLines = good.length\n  ? good.map(i => `- ${i.title ? i.title + \" — \" : \"\"}${i.url}`).join(\"\\n\")\n  : \"- (no valid public sources found)\";\n\n// Replace existing \"Sources:\" block or append if missing\nconst reSourcesBlock = /Sources:\\s*[\\s\\S]*?(?=\\n[A-Z][^\\n]*:|$)/;\nlet finalPost = post;\nfinalPost = reSourcesBlock.test(post)\n  ? post.replace(reSourcesBlock, `Sources:\\n${sourcesLines}\\n`)\n  : `${post.trim()}\\n\\nSources:\\n${sourcesLines}\\n`;\n\n// -------- 3) Extra hardening: remove banned shorteners from BODY (not from Sources) --------\nconst urlRe = /\\bhttps?:\\/\\/[^\\s)\\]>.,;:]+/g;\nconst srcTailMatch = finalPost.match(/Sources:\\s*[\\s\\S]*$/i);\nlet bodyPart = finalPost, sourcesTail = \"\";\nif (srcTailMatch) {\n  const start = finalPost.indexOf(srcTailMatch[0]);\n  bodyPart = finalPost.slice(0, start);\n  sourcesTail = finalPost.slice(start);\n}\n// Strip any banned links that somehow remain in the body\nbodyPart = bodyPart.replace(urlRe, (u) => {\n  try {\n    const h = new URL(u).hostname.replace(/^www\\./, \"\");\n    return banned.has(h) ? \"\" : u;\n  } catch { return \"\"; }\n});\nfinalPost = (bodyPart.replace(/[ \\t]+$/gm, \"\").trim() + \"\\n\\n\" + sourcesTail.trim()).trim();\n\n// -------- 4) Build a human (label-free) version for publishing --------\nfunction grabLine(label, text) {\n  const m = text.match(new RegExp(\"^\\\\s*\" + label + \":\\\\s*(.+)$\", \"mi\"));\n  return m ? m[1].trim() : \"\";\n}\nfunction grabBlock(label, text) {\n  const m = text.match(new RegExp(\"^\\\\s*\" + label + \":\\\\s*$\", \"mi\"));\n  if (!m) return \"\";\n  const start = m.index + m[0].length;\n  const tail = text.slice(start);\n  const stop = tail.search(/^\\s*(Mini Use Case|Sources|Hashtags):\\s*$/mi);\n  return (stop >= 0 ? tail.slice(0, stop) : tail).trim();\n}\n\nconst title = grabLine(\"Title\", finalPost);\nconst hook  = grabLine(\"Hook\", finalPost);\nconst insightBlock = grabBlock(\"Insight\", finalPost);\nconst insights = insightBlock\n  ? insightBlock.split(\"\\n\")\n      .map(l => l.trim())\n      .filter(l => l.startsWith(\"- \"))\n      .map(l => l.replace(/^-+\\s*/, \"\").trim())\n  : [];\n\nconst mucBlock = grabBlock(\"Mini Use Case\", finalPost);\nconst prob = (mucBlock.match(/^\\s*-\\s*Problem:\\s*(.+)$/mi)  || [])[1]?.trim() || \"\";\nconst appr = (mucBlock.match(/^\\s*-\\s*Approach:\\s*(.+)$/mi) || [])[1]?.trim() || \"\";\nconst imp  = (mucBlock.match(/^\\s*-\\s*Impact:\\s*(.+)$/mi)   || [])[1]?.trim() || \"\";\n\n// Hashtags line (may or may not exist here; a later \"Final Polish\" node will dedupe/remove the label)\nconst hashtags = grabLine(\"Hashtags\", finalPost);\n\n// Keep signature if it existed anywhere\nconst keepSignature = /This post written by my AI Agent/i.test(finalPost);\n\n// Compose human-friendly post\nlet human = \"\";\nif (title) human += title + \"\\n\";\nif (hook)  human += hook + \"\\n\\n\";\nif (insights.length) human += insights.join(\"\\n\") + \"\\n\\n\";\nif (prob || appr || imp) {\n  human += \"Example: \";\n  if (prob) human += prob.endsWith(\".\") ? prob + \" \" : prob + \". \";\n  if (appr) human += \"Approach: \" + (appr.endsWith(\".\") ? appr + \" \" : appr + \". \");\n  if (imp)  human += \"Impact: \" + (imp.endsWith(\".\") ? imp : imp + \".\");\n  human += \"\\n\\n\";\n}\n// Append validated Sources block as-is\nconst sourcesPart = finalPost.match(/Sources:\\s*[\\s\\S]*$/i)?.[0]?.trim() || \"Sources:\\n- \";\nhuman += sourcesPart + \"\\n\\n\";\n// Append hashtags line if present (Final Polish will render as plain tags)\nif (hashtags) human += `Hashtags: ${hashtags}\\n`;\n// Optional signature\nif (keepSignature) human += \"This post written by my AI Agent\\n\";\n\n// Tidy\nhuman = human\n  .replace(/\\n{3,}/g, \"\\n\\n\")\n  .replace(/[ \\t]+$/gm, \"\")\n  .trim();\n\n// -------- 5) Emit --------\nreturn [{\n  json: {\n    final_post: finalPost,                 // structured (for validation/repair)\n    human_post: human,                    // humanized (for publishing; Final Polish will refine)\n    total_links: items.length,\n    valid_links: good.length,\n    invalid_links: items.length - good.length\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1584,
+        -912
+      ],
+      "id": "8cec146a-c422-407f-984e-d7698b7cde4a",
+      "name": "Assemble Final Post"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge the HTTP node's outputs with the original items from\n// \"Extract & Sanitize Sources\" so url/title/post are preserved.\n\nconst httpItems = $input.all();                          // outputs from Validate URL\nconst srcItems  = $items(\"Extract & Sanitize Sources\", 0); // originals from earlier node (run 0)\n\n// If we can't access originals for some reason, just pass through\nif (!Array.isArray(srcItems) || srcItems.length === 0) {\n  return httpItems;\n}\n\nconst out = httpItems.map((it, idx) => {\n  const http = it?.json ?? {};\n  const src  = srcItems[idx]?.json ?? {};\n\n  // Build a clean merged record.\n  // Prefer original url/title/post from src; keep HTTP status/headers.\n  return {\n    json: {\n      url: src.url ?? http.url ?? \"\",\n      title: src.title ?? http.title ?? \"\",\n      post: src.post ?? http.post ?? \"\",\n\n      statusCode: http.statusCode,\n      headers: http.headers,\n\n      // Keep any diagnostic flags if present\n      reason: http.reason ?? src.reason,\n      valid: http.valid ?? src.valid\n    }\n  };\n});\n\nreturn out;\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1360,
+        -912
+      ],
+      "id": "5043252b-005c-4ecf-812d-f6cd1e29e54c",
+      "name": "Merge Originals"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "70d29b86-1212-477e-9d44-9b26cad1fdd3",
+              "leftValue": "={{$json.valid_links}}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1808,
+        -912
+      ],
+      "id": "17a0a93a-760e-4a77-a38a-38a9e1122ea6",
+      "name": "Needs Repair?"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Replace ONLY the “Sources” section below with 2–3 new, public, direct HTTPS URLs (no redirects, no shorteners, no paywalls, no tracking params). Keep ALL other text identical.\n\nRules:\n- Allowed examples: arxiv.org, nist.gov, mit.edu, stanford.edu, oecd.org, pewresearch.org, weforum.org, openai.com/research, anthropic.com/news, deepmind.google/discover, microsoft.com/research, aws.amazon.com/blogs, cloud.google.com/blog, meta.com/research, salesforce.com/blog, zendesk.com/blog or /cx/trends, intercom.com/blog, hubspot.com/research, ibm.com/blog, adobe.com/insights, thinkwithgoogle.com, iab.com.\n- Reject and do NOT output: lnkd.in, bit.ly, t.co, tinyurl.com, ow.ly, rebrand.ly, buff.ly, goo.gl, shorturl.at, cutt.ly.\n- If uncertain a URL exists publicly, choose a different source you can verify.\n\nPost:\n<<<{{$json.final_post}}>>>\n\nReturn ONLY the corrected full block beginning with “Sources:” and its bullet lines.\n",
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.7,
+      "position": [
+        2032,
+        -912
+      ],
+      "id": "27693622-7bce-47ed-90c8-4dbcffd9d1cb",
+      "name": "Repair Sources (LLM)"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "gpt-5",
+          "mode": "list",
+          "cachedResultName": "gpt-5"
+        },
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.2,
+      "position": [
+        2112,
+        -688
+      ],
+      "id": "294ab6c8-a9f7-4058-a33e-5befff976082",
+      "name": "OpenAI Chat Model1",
+      "credentials": {
+        "openAiApi": {
+          "id": "86z6v2YmBM4fCsnr",
+          "name": "OpenAi account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Pull the original final_post from the Assemble node (run 0)\n// and the repaired Sources block from the LLM output.\nconst original = $items(\"Assemble Final Post\", 0)[0]?.json?.final_post || \"\";\nconst repairedBlock = ($input.all()[0]?.json?.text || $input.all()[0]?.json?.output || \"\").trim();\n\n// Safety checks\nif (!original) {\n  return [{ json: { error: \"Missing original final_post from Assemble Final Post.\", final_post: \"\" } }];\n}\nif (!repairedBlock.toLowerCase().startsWith(\"sources:\")) {\n  return [{ json: { error: \"LLM did not return a 'Sources:' block.\", final_post: original } }];\n}\n\n// Replace existing Sources block, or append if missing\nconst re = /Sources:\\s*[\\s\\S]*?(?=\\n[A-Z][^\\n]*:|$)/;\nconst merged = re.test(original)\n  ? original.replace(re, repairedBlock + \"\\n\")\n  : `${original}\\n\\n${repairedBlock}\\n`;\n\nreturn [{ json: { post: merged } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2384,
+        -912
+      ],
+      "id": "d7ea5301-ebe9-40e0-84cc-a2bb0399f1d8",
+      "name": "Inject Repaired Sources"
+    },
+    {
+      "parameters": {
+        "jsCode": "// INPUT ASSUMPTION: the LLM post is in $json.post (adjust if your field is different)\nconst text =\n  $json.post ||\n  $json.llm_output ||\n  $json.text ||\n  Object.values($json)[0];\n\nif (!text) {\n  return [{ json: { error: \"No post text found. Ensure LLM output goes to `post`.\" } }];\n}\n\n// Grab only the Sources block\nconst sourcesBlock = (text.split(\"Sources:\")[1] || \"\").split(\"Hashtags:\")[0] || \"\";\n\n// Parse lines that look like:\n// - Title — https://domain/path\n// - https://domain/path\nconst lines = sourcesBlock\n  .split(\"\\n\")\n  .map(l => l.trim())\n  .filter(l => l.startsWith(\"- \"));\n\nconst deny = new Set([\n  \"lnkd.in\",\"bit.ly\",\"t.co\",\"tinyurl.com\",\"ow.ly\",\"rebrand.ly\",\"buff.ly\",\"goo.gl\",\"shorturl.at\",\"cutt.ly\"\n]);\n\nconst items = [];\nconst seen = new Set();\n\nfor (const line of lines) {\n  // capture title and URL if present\n  let m = line.match(/-\\s*(.+?)\\s+—\\s+(https?:\\/\\/\\S+)/i) || line.match(/-\\s*(https?:\\/\\/\\S+)/i);\n  if (!m) continue;\n\n  let title, url;\n  if (m.length === 3) { title = m[1]; url = m[2]; }\n  else { title = \"\"; url = m[1]; }\n\n  // tidy trailing punctuation\n  url = url.replace(/[)\\]>.,;:]+$/, \"\");\n\n  // Basic URL hygiene / canonicalization\n  try {\n    const u = new URL(url);\n    const host = u.hostname.replace(/^www\\./, \"\");\n    if (u.protocol !== \"https:\") {\n      items.push({ url, title, reason: \"non-https\", valid: false, post: text });\n      continue;\n    }\n    if (deny.has(host)) {\n      items.push({ url, title, reason: \"shortener\", valid: false, post: text });\n      continue;\n    }\n    // Strip trackers\n    const drop = [\"utm_\", \"gclid\", \"fbclid\", \"mc_cid\", \"mc_eid\", \"igshid\"];\n    for (const [k] of [...u.searchParams]) if (drop.some(p => k.startsWith(p))) u.searchParams.delete(k);\n    url = u.origin + u.pathname + (u.search ? \"?\" + u.searchParams.toString() : \"\") + (u.hash || \"\");\n  } catch (e) {\n    items.push({ url, title, reason: \"bad-url\", valid: false, post: text });\n    continue;\n  }\n\n  const key = `${title}||${url}`;\n  if (seen.has(key)) continue;\n  seen.add(key);\n\n  items.push({ url, title, post: text });\n}\n\n// Emit one item per URL (keeps original post on each item)\nreturn items.length\n  ? items.map(i => ({ json: i }))\n  : [{ json: { warning: \"No sources parsed. Ensure LLM outputs a 'Sources:' section.\", post: text } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2608,
+        -912
+      ],
+      "id": "fa40d2df-f74c-4bef-a356-3cc3e332bfe0",
+      "name": "Extract & Sanitize Sources (repair)"
+    },
+    {
+      "parameters": {
+        "method": "HEAD",
+        "url": "={{$json.url}}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "text/html,application/pdf"
+            }
+          ]
+        },
+        "options": {
+          "redirect": {
+            "redirect": {
+              "followRedirects": false
+            }
+          },
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "text"
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2832,
+        -912
+      ],
+      "id": "d6e54ead-20aa-4090-962d-7ebe9d80a640",
+      "name": "Validate URL (repair)",
+      "retryOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge the HTTP node's outputs with the original items from\n// \"Extract & Sanitize Sources\" so url/title/post are preserved.\n\nconst httpItems = $input.all();                          // outputs from Validate URL\nconst srcItems  = $items(\"Extract & Sanitize Sources\", 0); // originals from earlier node (run 0)\n\n// If we can't access originals for some reason, just pass through\nif (!Array.isArray(srcItems) || srcItems.length === 0) {\n  return httpItems;\n}\n\nconst out = httpItems.map((it, idx) => {\n  const http = it?.json ?? {};\n  const src  = srcItems[idx]?.json ?? {};\n\n  // Build a clean merged record.\n  // Prefer original url/title/post from src; keep HTTP status/headers.\n  return {\n    json: {\n      url: src.url ?? http.url ?? \"\",\n      title: src.title ?? http.title ?? \"\",\n      post: src.post ?? http.post ?? \"\",\n\n      statusCode: http.statusCode,\n      headers: http.headers,\n\n      // Keep any diagnostic flags if present\n      reason: http.reason ?? src.reason,\n      valid: http.valid ?? src.valid\n    }\n  };\n});\n\nreturn out;\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3056,
+        -912
+      ],
+      "id": "db5c1ad5-e9cc-4bb2-916f-0bf4ef703c14",
+      "name": "Merge Originals (repair)"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Assemble Final Post (with shortener hard-ban + humanized output)\n// Use this exact code in BOTH:\n//   - \"Assemble Final Post\"\n//   - \"Assemble Final Post (repair)\"\n\n// -------- 0) Collect inputs --------\nconst items = $input.all().map(i => i.json);\nif (!items.length) {\n  return [{\n    json: {\n      final_post: \"\",\n      human_post: \"\",\n      total_links: 0,\n      valid_links: 0,\n      invalid_links: 0,\n      warning: \"No items received by Assemble node.\"\n    }\n  }];\n}\n\n// The original structured post text (carried forward on each item)\nlet post = items[0]?.post || \"\";\n\n// -------- 1) Validate + select GOOD links --------\n// Hard-ban common shorteners regardless of HTTP status.\nconst banned = new Set([\n  \"lnkd.in\",\"bit.ly\",\"t.co\",\"tinyurl.com\",\"ow.ly\",\n  \"rebrand.ly\",\"buff.ly\",\"goo.gl\",\"shorturl.at\",\"cutt.ly\"\n]);\n\nconst good = items.filter(i => {\n  try {\n    const urlStr = String(i.url || \"\");\n    const u = new URL(urlStr);\n    const host = u.hostname.replace(/^www\\./, \"\");\n    if (banned.has(host)) return false; // hard-ban shorteners\n\n    const sc = Number(i.statusCode);\n    const ct = String(i.headers?.[\"content-type\"] || i.headers?.[\"Content-Type\"] || \"\").toLowerCase();\n\n    // Accept only direct, public pages (200 OK + html/pdf)\n    const typeOK = ct.includes(\"text/html\") || ct.includes(\"application/pdf\");\n    return sc === 200 && typeOK;\n  } catch {\n    return false;\n  }\n});\n\n// -------- 2) Rebuild the Sources block from GOOD links only --------\nconst sourcesLines = good.length\n  ? good.map(i => `- ${i.title ? i.title + \" — \" : \"\"}${i.url}`).join(\"\\n\")\n  : \"- (no valid public sources found)\";\n\n// Replace existing \"Sources:\" block or append if missing\nconst reSourcesBlock = /Sources:\\s*[\\s\\S]*?(?=\\n[A-Z][^\\n]*:|$)/;\nlet finalPost = post;\nfinalPost = reSourcesBlock.test(post)\n  ? post.replace(reSourcesBlock, `Sources:\\n${sourcesLines}\\n`)\n  : `${post.trim()}\\n\\nSources:\\n${sourcesLines}\\n`;\n\n// -------- 3) Extra hardening: remove banned shorteners from BODY (not from Sources) --------\nconst urlRe = /\\bhttps?:\\/\\/[^\\s)\\]>.,;:]+/g;\nconst srcTailMatch = finalPost.match(/Sources:\\s*[\\s\\S]*$/i);\nlet bodyPart = finalPost, sourcesTail = \"\";\nif (srcTailMatch) {\n  const start = finalPost.indexOf(srcTailMatch[0]);\n  bodyPart = finalPost.slice(0, start);\n  sourcesTail = finalPost.slice(start);\n}\n// Strip any banned links that somehow remain in the body\nbodyPart = bodyPart.replace(urlRe, (u) => {\n  try {\n    const h = new URL(u).hostname.replace(/^www\\./, \"\");\n    return banned.has(h) ? \"\" : u;\n  } catch { return \"\"; }\n});\nfinalPost = (bodyPart.replace(/[ \\t]+$/gm, \"\").trim() + \"\\n\\n\" + sourcesTail.trim()).trim();\n\n// -------- 4) Build a human (label-free) version for publishing --------\nfunction grabLine(label, text) {\n  const m = text.match(new RegExp(\"^\\\\s*\" + label + \":\\\\s*(.+)$\", \"mi\"));\n  return m ? m[1].trim() : \"\";\n}\nfunction grabBlock(label, text) {\n  const m = text.match(new RegExp(\"^\\\\s*\" + label + \":\\\\s*$\", \"mi\"));\n  if (!m) return \"\";\n  const start = m.index + m[0].length;\n  const tail = text.slice(start);\n  const stop = tail.search(/^\\s*(Mini Use Case|Sources|Hashtags):\\s*$/mi);\n  return (stop >= 0 ? tail.slice(0, stop) : tail).trim();\n}\n\nconst title = grabLine(\"Title\", finalPost);\nconst hook  = grabLine(\"Hook\", finalPost);\nconst insightBlock = grabBlock(\"Insight\", finalPost);\nconst insights = insightBlock\n  ? insightBlock.split(\"\\n\")\n      .map(l => l.trim())\n      .filter(l => l.startsWith(\"- \"))\n      .map(l => l.replace(/^-+\\s*/, \"\").trim())\n  : [];\n\nconst mucBlock = grabBlock(\"Mini Use Case\", finalPost);\nconst prob = (mucBlock.match(/^\\s*-\\s*Problem:\\s*(.+)$/mi)  || [])[1]?.trim() || \"\";\nconst appr = (mucBlock.match(/^\\s*-\\s*Approach:\\s*(.+)$/mi) || [])[1]?.trim() || \"\";\nconst imp  = (mucBlock.match(/^\\s*-\\s*Impact:\\s*(.+)$/mi)   || [])[1]?.trim() || \"\";\n\n// Hashtags line (may or may not exist here; a later \"Final Polish\" node will dedupe/remove the label)\nconst hashtags = grabLine(\"Hashtags\", finalPost);\n\n// Keep signature if it existed anywhere\nconst keepSignature = /This post written by my AI Agent/i.test(finalPost);\n\n// Compose human-friendly post\nlet human = \"\";\nif (title) human += title + \"\\n\";\nif (hook)  human += hook + \"\\n\\n\";\nif (insights.length) human += insights.join(\"\\n\") + \"\\n\\n\";\nif (prob || appr || imp) {\n  human += \"Example: \";\n  if (prob) human += prob.endsWith(\".\") ? prob + \" \" : prob + \". \";\n  if (appr) human += \"Approach: \" + (appr.endsWith(\".\") ? appr + \" \" : appr + \". \");\n  if (imp)  human += \"Impact: \" + (imp.endsWith(\".\") ? imp : imp + \".\");\n  human += \"\\n\\n\";\n}\n// Append validated Sources block as-is\nconst sourcesPart = finalPost.match(/Sources:\\s*[\\s\\S]*$/i)?.[0]?.trim() || \"Sources:\\n- \";\nhuman += sourcesPart + \"\\n\\n\";\n// Append hashtags line if present (Final Polish will render as plain tags)\nif (hashtags) human += `Hashtags: ${hashtags}\\n`;\n// Optional signature\nif (keepSignature) human += \"This post written by my AI Agent\\n\";\n\n// Tidy\nhuman = human\n  .replace(/\\n{3,}/g, \"\\n\\n\")\n  .replace(/[ \\t]+$/gm, \"\")\n  .trim();\n\n// -------- 5) Emit --------\nreturn [{\n  json: {\n    final_post: finalPost,                 // structured (for validation/repair)\n    human_post: human,                    // humanized (for publishing; Final Polish will refine)\n    total_links: items.length,\n    valid_links: good.length,\n    invalid_links: items.length - good.length\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4752,
+        -912
+      ],
+      "id": "52271558-5585-4f97-b3d1-eeb749704fa3",
+      "name": "Assemble Final Post (repair)"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "4e942bdf-0d67-4189-975a-72bd32c811b3",
+              "leftValue": "={{$json.valid_links}}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        4976,
+        -912
+      ],
+      "id": "873def4b-f7a0-408f-952f-40adf9cc9d9c",
+      "name": "Repair Successful?"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Items arriving here each include: url, title, post, statusCode, headers\nconst arr = $input.all().map(i => i.json);\n\n// Good if 200 OK and HTML/PDF\nconst isGood = i => {\n  const sc = Number(i.statusCode);\n  const ct = String(i.headers?.['content-type'] || i.headers?.['Content-Type'] || '').toLowerCase();\n  return sc === 200 && (ct.includes('text/html') || ct.includes('application/pdf'));\n};\n\nconst bad = arr.filter(i => !isGood(i));\nconst good = arr.filter(isGood);\n\n// Rebuild current Sources bullets from all items (preserves order)\nconst bullets = arr.map(i => `- ${i.title ? i.title + \" — \" : \"\"}${i.url}`);\n\n// Bullets that correspond to failing items (same order/indices)\nconst badBullets = bad.map(i => `- ${i.title ? i.title + \" — \" : \"\"}${i.url}`);\n\n// Grab the full post text from the first item\nconst post = arr[0]?.post || \"\";\n\n// Extract current Sources block (best effort)\nconst sourcesBlock = (post.split(\"Sources:\")[1] || \"\").split(\"\\nHashtags:\")[0] || \"\";\n\nreturn [{\n  json: {\n    post,\n    total_links: arr.length,\n    valid_links: good.length,\n    invalid_links: bad.length,\n    sources_block: sourcesBlock.trim(),\n    all_bullets: bullets,\n    bad_bullets: badBullets\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3280,
+        -912
+      ],
+      "id": "7075935b-4c4b-4b76-9622-6d34b3ff61ba",
+      "name": "Summarize Link Errors (repair)"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Rewrite ONLY the failing \"Sources\" bullets below. Return the SAME number of bullets in the SAME order, using public, direct HTTPS URLs (no redirects/shorteners/paywalls/tracking).\n\nRules:\n- Allowed example domains: arxiv.org, nist.gov, mit.edu, stanford.edu, oecd.org, pewresearch.org, weforum.org, openai.com/research, anthropic.com/news, deepmind.google/discover, microsoft.com/research, aws.amazon.com/blogs, cloud.google.com/blog, meta.com/research, salesforce.com/blog, zendesk.com/blog or /cx/trends, intercom.com/blog, hubspot.com/research, ibm.com/blog, adobe.com/insights, thinkwithgoogle.com, iab.com.\n- Reject: lnkd.in, bit.ly, t.co, tinyurl.com, ow.ly, rebrand.ly, buff.ly, goo.gl, shorturl.at, cutt.ly.\n- Use canonical, working URLs only.\n\nFailing bullets (in order):\n<<<\n{{$json.bad_bullets.join(\"\\n\")}}\n>>>\n\nReturn ONLY the new bullet lines, one per line, starting with \"- \".\n",
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.7,
+      "position": [
+        3504,
+        -912
+      ],
+      "id": "33b6c415-3ee3-4012-a6a6-714f882961b8",
+      "name": "Rewrite Failing Sources"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "gpt-5",
+          "mode": "list",
+          "cachedResultName": "gpt-5"
+        },
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.2,
+      "position": [
+        3584,
+        -688
+      ],
+      "id": "4f3424d8-eec3-4da2-bdea-7156e06e9b64",
+      "name": "OpenAI Chat Model2",
+      "credentials": {
+        "openAiApi": {
+          "id": "86z6v2YmBM4fCsnr",
+          "name": "OpenAi account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Pull context from the summarizer (original post + bullets)\nconst ctx = $items(\"Summarize Link Errors (repair)\", 0)[0]?.json || {};\nconst post = ctx.post || \"\";\nconst allBullets = Array.isArray(ctx.all_bullets) ? ctx.all_bullets : [];\nconst badBullets = Array.isArray(ctx.bad_bullets) ? ctx.bad_bullets : [];\n\n// Get LLM output (the rewritten bullets for the failing ones), one per line\nconst llmText = ($input.all()[0]?.json?.text || $input.all()[0]?.json?.output || \"\").trim();\nconst newBadBullets = llmText\n  .split(\"\\n\")\n  .map(s => s.trim())\n  .filter(s => s.startsWith(\"- \"));\n\n// Safety checks\nif (!post) return [{ json: { error: \"Missing original post from Summarize Link Errors (repair).\", post: \"\" } }];\nif (!badBullets.length) return [{ json: { error: \"No failing bullets to replace.\", post } }];\nif (newBadBullets.length !== badBullets.length) {\n  return [{\n    json: {\n      error: `Count mismatch: expected ${badBullets.length} replacements, got ${newBadBullets.length}.`,\n      post\n    }\n  }];\n}\n\n// Helper to normalize bullet for comparison (ignore extra spaces)\nconst norm = s => s.replace(/\\s+/g, \" \").trim();\n\n// Build mapping: failing bullet (normalized) -> replacement line\nconst map = new Map();\nfor (let i = 0; i < badBullets.length; i++) {\n  map.set(norm(badBullets[i]), newBadBullets[i]);\n}\n\n// Replace only the failing bullets, preserve order of allBullets\nconst updatedBullets = allBullets.map(b => {\n  const key = norm(b);\n  return map.has(key) ? map.get(key) : b;\n});\n\n// Rebuild Sources block text\nconst newSources = \"Sources:\\n\" + updatedBullets.join(\"\\n\") + \"\\n\";\n\n// Replace existing Sources block (or append if missing)\nconst re = /Sources:\\s*[\\s\\S]*?(?=\\n[A-Z][^\\n]*:|$)/;\nconst mergedPost = re.test(post) ? post.replace(re, newSources) : (post + \"\\n\\n\" + newSources);\n\n// Output the updated post so we can re-validate links\nreturn [{ json: { post: mergedPost } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3856,
+        -912
+      ],
+      "id": "5a88d45d-453d-4af4-8bbe-0525f72b926f",
+      "name": "Apply Rewritten Bullets"
+    },
+    {
+      "parameters": {
+        "jsCode": "// INPUT ASSUMPTION: the LLM post is in $json.post (adjust if your field is different)\nconst text =\n  $json.post ||\n  $json.llm_output ||\n  $json.text ||\n  Object.values($json)[0];\n\nif (!text) {\n  return [{ json: { error: \"No post text found. Ensure LLM output goes to `post`.\" } }];\n}\n\n// Grab only the Sources block\nconst sourcesBlock = (text.split(\"Sources:\")[1] || \"\").split(\"Hashtags:\")[0] || \"\";\n\n// Parse lines that look like:\n// - Title — https://domain/path\n// - https://domain/path\nconst lines = sourcesBlock\n  .split(\"\\n\")\n  .map(l => l.trim())\n  .filter(l => l.startsWith(\"- \"));\n\nconst deny = new Set([\n  \"lnkd.in\",\"bit.ly\",\"t.co\",\"tinyurl.com\",\"ow.ly\",\"rebrand.ly\",\"buff.ly\",\"goo.gl\",\"shorturl.at\",\"cutt.ly\"\n]);\n\nconst items = [];\nconst seen = new Set();\n\nfor (const line of lines) {\n  // capture title and URL if present\n  let m = line.match(/-\\s*(.+?)\\s+—\\s+(https?:\\/\\/\\S+)/i) || line.match(/-\\s*(https?:\\/\\/\\S+)/i);\n  if (!m) continue;\n\n  let title, url;\n  if (m.length === 3) { title = m[1]; url = m[2]; }\n  else { title = \"\"; url = m[1]; }\n\n  // tidy trailing punctuation\n  url = url.replace(/[)\\]>.,;:]+$/, \"\");\n\n  // Basic URL hygiene / canonicalization\n  try {\n    const u = new URL(url);\n    const host = u.hostname.replace(/^www\\./, \"\");\n    if (u.protocol !== \"https:\") {\n      items.push({ url, title, reason: \"non-https\", valid: false, post: text });\n      continue;\n    }\n    if (deny.has(host)) {\n      items.push({ url, title, reason: \"shortener\", valid: false, post: text });\n      continue;\n    }\n    // Strip trackers\n    const drop = [\"utm_\", \"gclid\", \"fbclid\", \"mc_cid\", \"mc_eid\", \"igshid\"];\n    for (const [k] of [...u.searchParams]) if (drop.some(p => k.startsWith(p))) u.searchParams.delete(k);\n    url = u.origin + u.pathname + (u.search ? \"?\" + u.searchParams.toString() : \"\") + (u.hash || \"\");\n  } catch (e) {\n    items.push({ url, title, reason: \"bad-url\", valid: false, post: text });\n    continue;\n  }\n\n  const key = `${title}||${url}`;\n  if (seen.has(key)) continue;\n  seen.add(key);\n\n  items.push({ url, title, post: text });\n}\n\n// Emit one item per URL (keeps original post on each item)\nreturn items.length\n  ? items.map(i => ({ json: i }))\n  : [{ json: { warning: \"No sources parsed. Ensure LLM outputs a 'Sources:' section.\", post: text } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4080,
+        -912
+      ],
+      "id": "edc3ad39-10de-4a2f-91bd-6de336ef0851",
+      "name": "Extract & Sanitize Sources (repair V2)"
+    },
+    {
+      "parameters": {
+        "method": "HEAD",
+        "url": "={{$json.url}}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "text/html,application/pdf"
+            }
+          ]
+        },
+        "options": {
+          "redirect": {
+            "redirect": {
+              "followRedirects": false
+            }
+          },
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "text"
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4304,
+        -912
+      ],
+      "id": "18f7d194-19b4-4162-af00-c781635514ad",
+      "name": "Validate URL (repairV2)",
+      "retryOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge the HTTP node's outputs with the original items from\n// \"Extract & Sanitize Sources\" so url/title/post are preserved.\n\nconst httpItems = $input.all();                          // outputs from Validate URL\nconst srcItems  = $items(\"Extract & Sanitize Sources\", 0); // originals from earlier node (run 0)\n\n// If we can't access originals for some reason, just pass through\nif (!Array.isArray(srcItems) || srcItems.length === 0) {\n  return httpItems;\n}\n\nconst out = httpItems.map((it, idx) => {\n  const http = it?.json ?? {};\n  const src  = srcItems[idx]?.json ?? {};\n\n  // Build a clean merged record.\n  // Prefer original url/title/post from src; keep HTTP status/headers.\n  return {\n    json: {\n      url: src.url ?? http.url ?? \"\",\n      title: src.title ?? http.title ?? \"\",\n      post: src.post ?? http.post ?? \"\",\n\n      statusCode: http.statusCode,\n      headers: http.headers,\n\n      // Keep any diagnostic flags if present\n      reason: http.reason ?? src.reason,\n      valid: http.valid ?? src.valid\n    }\n  };\n});\n\nreturn out;\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4528,
+        -912
+      ],
+      "id": "b200db4d-491f-465c-a4d8-b6e36c2a4b06",
+      "name": "Merge Originals (repairV2)"
+    },
+    {
+      "parameters": {
+        "person": "FzCC8BViXQ",
+        "text": "={{ (\"\" + ($json.human_post_clean || $json.human_post || $json.final_post || $json.post || $json.content || $json.text || \"\"))\n   .replace(/\\u200B/g,\"\").replace(/\\r/g,\"\").trim().slice(0,2900) }}\n\n",
+        "additionalFields": {}
+      },
+      "type": "n8n-nodes-base.linkedIn",
+      "typeVersion": 1,
+      "position": [
+        5648,
+        -912
+      ],
+      "id": "8c68807d-bbcc-4da6-82dc-56269aac5d60",
+      "name": "Create a post",
+      "credentials": {
+        "linkedInOAuth2Api": {
+          "id": "unos8OybDMaiSz5K",
+          "name": "LinkedIn account 3"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=ROLE\nYou are a senior AI product strategist and LinkedIn Top Voice. Write professional, credible thought-leadership posts that leaders want to save and share.\n\nAUDIENCE\nVP/Director+ in CRM, Customer Support, Advertising/MarTech, and adjacent industries.\n\nTOPIC ROTATION & VARIETY\n- For each run choose ONE focus: CRM • Customer Support • Advertising/MarTech • Sales Enablement • Retail/eCommerce • Healthcare • Finance • Manufacturing • Telecom • Travel/Hospitality • Education • Logistics.\n- Avoid repeating topics in: {{ $json.recent_topics || \"\" }}.\n- Randomly choose ONE structure: mini-case study • contrarian take • numbered playbook • myth vs fact • Q&A • data-led insight.\n- Vary hook style (question • stat • bold claim • story • analogy). Do NOT reuse phrasing from: {{ $json.recent_hooks || \"\" }} or {{ $json.recent_posts || \"\" }}.\n\nWORKING SOURCES ONLY (STRICT)\n- Include 2–3 **direct, working** URLs (HTTPS, no redirects, no shorteners, no tracking params).\n- **Ban** link shorteners/redirects: lnkd.in, bit.ly, t.co, tinyurl, etc.\n- **Avoid** gated/paywalled sources (login, form fill, subscriber-only). If paywalled, choose a different public source supporting the same point.\n- Prefer reputable, publicly accessible domains. Examples (not exhaustive):  \n  arxiv.org • nist.gov • mit.edu • stanford.edu • harvard.edu • weforum.org • oecd.org • nber.org (open items) • mckinsey.com/insights • bain.com/insights • bcg.com/publications • deloitte.com/insights • openai.com/research • anthropic.com/news • deepmind.google/discover • microsoft.com/research • aws.amazon.com/blogs • cloud.google.com/blog • meta.com/research • salesforce.com/blog • zendesk.com/blog or /cx/trends • intercom.com/blog • hubspot.com/research • twilio.com/blog • ibm.com/blog • adobe.com/insights • thinkwithgoogle.com • iab.com • pewresearch.org • nist.gov • data.gov\n- **Self-check before finalizing**: If you are not 100% certain a URL exists and is publicly accessible, do NOT guess—replace the claim with one you can support using a known public source.\n- Strip tracking parameters (e.g., remove `?utm_*`, `#:` fragments). Use canonical URLs only.\n\nCONTENT REQUIREMENTS\n- Length: 140–220 words for the body (excluding headings, Sources, hashtags, signature).\n- Start with a sharp one-sentence hook (≤20 words).\n- Make it practical: what changed, why it matters, what to do next.\n- Include ONE concrete mini use case with an implied metric (e.g., time saved %, cost reduced, CSAT uplift).\n- Tone: expert, specific, cliche-free. No emojis in the body.\n- Links: Do not include URLs anywhere in the body. Put 2–3 direct, public HTTPS sources only under a “Sources:” section at the end. Never use link shorteners (e.g., lnkd.in, bit.ly)\n\nOUTPUT FORMAT (use these exact labels and order)\nTitle: <compelling, ≤10 words, no emojis>\nHook: <one sentence>\nInsight:\n- <2–3 bullet points with the main takeaways>\nMini Use Case:\n- Problem: <1 line>\n- Approach: <1–2 lines>\n- Impact: <1 line with a realistic metric proxy>\nSources:\n- <Source title or short description> — <HTTPS URL without redirects or tracking>\n- <Source title or short description> — <HTTPS URL without redirects or tracking>\nHashtags: <8–12 topic-relevant hashtags; mix broad + niche>\nThis post written by my AI Agent\n\nCONSTRAINTS\n- No two runs may share the same combination of topic, structure, hook style, or phrasing.\n- Do not mention this prompt, internal rules, or “as an AI”.\n- Do not place links or hashtags inside the body; only in Sources/Hashtags sections.\n-If any style_flags is true for the pattern you’re about to use, choose a different structure and hook style.\n\nOPTIONAL VARIABLES (if present, respect them)\nForcedTopic: {{ $json.topic || \"\" }}\nRecentTopics: {{ $json.recent_topics || \"\" }}\nRecentHooks: {{ $json.recent_hooks || \"\" }}\nRecentPosts: {{ $json.recent_posts || \"\" }}\n\nAt the end, print hashtags on a separate line without any “Hashtags:” label.",
+        "batching": {
+          "batchSize": null,
+          "delayBetweenBatches": 5
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.7,
+      "position": [
+        368,
+        -912
+      ],
+      "id": "abd0c640-dc9a-4fa2-a6bd-008e947646d5",
+      "name": "Basic LLM:Write Post"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Take the LLM output and remove EVERY url from the body.\n// Only the \"Sources:\" block is allowed to contain links.\n\nconst first = $input.all()?.[0]?.json ?? {};\nconst text =\n  first.final_post || first.post || first.content || first.text || Object.values(first)[0] || \"\";\n\nif (!text) return [{ json: { post: \"\", note: \"Empty LLM text\" } }];\n\n// Split on Sources and Hashtags (case-insensitive)\nconst sourcesIdx = text.search(/^\\s*Sources:\\s*$/im);\nconst hashtagsIdx = text.search(/^\\s*Hashtags:\\s*$/im);\n\nconst urlRe = /\\bhttps?:\\/\\/[^\\s)\\]>.,;:]+/g;\n\nlet body, sourcesSection = \"\", hashtagsSection = \"\";\n\n// Extract sections\nif (sourcesIdx !== -1) {\n  body = text.slice(0, sourcesIdx);\n  const afterSources = text.slice(sourcesIdx);\n  if (hashtagsIdx !== -1 && hashtagsIdx > sourcesIdx) {\n    sourcesSection = afterSources.slice(0, hashtagsIdx - sourcesIdx);\n    hashtagsSection = text.slice(hashtagsIdx);\n  } else {\n    sourcesSection = afterSources;\n  }\n} else {\n  body = text;\n}\n\n// 1) Strip ALL urls from the body\nlet cleanBody = String(body).replace(urlRe, \"\");\n\n// 2) Normalize whitespace\ncleanBody = cleanBody.replace(/[ \\t]+$/gm, \"\").replace(/\\n{3,}/g, \"\\n\\n\").trim();\n\n// 3) Ensure we still have an explicit Sources header\nlet cleanSources = sourcesSection;\nif (!/^\\s*Sources:\\s*$/im.test(cleanSources)) {\n  // If there wasn't a Sources header, create an empty one\n  cleanSources = (cleanSources.trim().length ? cleanSources : \"Sources:\\n\");\n  if (!/^Sources:/i.test(cleanSources.trim())) {\n    cleanSources = \"Sources:\\n\" + cleanSources.trim() + \"\\n\";\n  }\n}\n\n// Reassemble in canonical order: Title/Hook/Body → Sources → Hashtags → signature line if any\nlet final = cleanBody.trim();\nif (final.length) final += \"\\n\\n\";\nfinal += cleanSources.trim() + \"\\n\";\nif (hashtagsSection) final += \"\\n\" + hashtagsSection.trim() + \"\\n\";\n\n// Preserve signature if present anywhere\nif (!/This post written by my AI Agent/i.test(final) && /This post written by my AI Agent/i.test(text)) {\n  final += \"\\nThis post written by my AI Agent\\n\";\n}\n\nreturn [{ json: { post: final } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        688,
+        -912
+      ],
+      "id": "7d97e437-016e-4d79-a9d2-697ceb4d836d",
+      "name": "Strip Inline Links (Body)"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Final Polish (dedupe v2)\n// - One plain hashtag line (no \"Hashtags:\" label)\n// - Remove duplicate/stray hashtag lines (incl. \"hashtag#Tag\" form)\n// - Ensure a single signature\n// - Keep Sources intact; hide if it only says \"(no valid public sources found)\"\n\nlet text = $json.human_post || $json.final_post || $json.post || $json.content || $json.text || \"\";\n\n// Split out Sources block (keep content unchanged)\nconst srcMatch = text.match(/^\\s*Sources:\\s*[\\s\\S]*$/im);\nlet body = text, sources = \"\";\nif (srcMatch) {\n  const start = srcMatch.index;\n  body = text.slice(0, start).trimEnd();\n  sources = text.slice(start).trim();\n}\n\n// --- Gather hashtags anywhere in BODY (not in Sources) ---\nconst tagToken = /#([\\p{L}\\p{N}_]+)/gu;               // captures #Tag\nconst hasHashWord = /\\bhashtag\\s*#/gi;                // handles \"hashtag#Tag\"\nconst plainHashLineRe = /^\\s*(?:#|\\bhashtag\\s*#)[^\\n]+$/iu; // lines that are mostly hashtags\n\n// Normalize \"hashtag#Tag\" to \"#Tag\" for collection (only for parsing; don't mutate original yet)\nconst bodyForTags = body.replace(hasHashWord, \"#\");\n\n// Collect tags from labelled or plain lines\nconst labelledMatch = bodyForTags.match(/^\\s*Hashtags:\\s*(.+)$/im);\nconst labelledTags = labelledMatch ? (labelledMatch[1].match(tagToken) || []).map(t => \"#\"+t.slice(1)) : [];\n\nconst plainTags = [];\nfor (const line of bodyForTags.split(\"\\n\")) {\n  if (plainHashLineRe.test(line.trim())) {\n    const found = line.match(tagToken) || [];\n    plainTags.push(...found.map(t => \"#\"+t.slice(1)));\n  }\n}\n\n// unify + de-dupe (case-insensitive, preserve first order)\nconst seen = new Set();\nconst allTags = [...labelledTags, ...plainTags].filter(t => {\n  const k = t.toLowerCase();\n  if (seen.has(k)) return false;\n  seen.add(k);\n  return true;\n});\n\n// --- Clean BODY: remove any hashtag lines & labels & duplicate signatures ---\nlet cleanedBody = body\n  .replace(/^\\s*Hashtags:\\s*.+$/gmi, \"\")                 // remove labelled lines\n  .split(\"\\n\").filter(l => !plainHashLineRe.test(l.trim())).join(\"\\n\") // remove hashtag-only lines\n  .replace(/^\\s*This post written by my AI Agent\\s*$/gmi, \"\")          // remove old signatures\n  .replace(/\\n{3,}/g, \"\\n\\n\")\n  .replace(/[ \\t]+$/gm, \"\")\n  .trim();\n\n// --- Sources: hide if it only contains \"(no valid public sources found)\" ---\nlet sourcesOut = sources.trim();\nif (/^Sources:\\s*$/i.test(sourcesOut) || /no valid public sources found/i.test(sourcesOut)) {\n  sourcesOut = \"\"; // drop empty/useless Sources section\n}\n\n// --- Build one plain hashtag line ---\nconst hashtagsLine = allTags.length ? allTags.join(\" \") : \"\";\n\n// --- Keep exactly one signature if it existed anywhere ---\nconst wantSignature = /This post written by my AI Agent/i.test(text);\n\n// --- Reassemble: Body → Sources (if any) → hashtags (if any) → signature (if wanted) ---\nlet out = cleanedBody;\nif (sourcesOut) {\n  out += (out ? \"\\n\\n\" : \"\") + sourcesOut;\n}\nif (hashtagsLine) {\n  out += (out ? \"\\n\\n\" : \"\") + hashtagsLine; // no \"Hashtags:\" label\n}\nif (wantSignature) {\n  out += (out ? \"\\n\" : \"\") + \"This post written by my AI Agent\";\n}\n\n// Final tidy\nout = out.replace(/\\n{3,}/g, \"\\n\\n\").trim();\n\nreturn [{ json: { human_post_clean: out, human_post: $json.human_post || \"\", final_post: $json.final_post || \"\" } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5424,
+        -912
+      ],
+      "id": "cc52d4cd-a035-4ab0-8950-9591c6d98fda",
+      "name": "Final Polish (dedupe)"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Forward the original assembled item so we can post it if repair fails.\n// Change \"Assemble Final Post\" below to match the exact name of your original assemble node.\nreturn [{ json: $items(\"Assemble Final Post\", 0)[0].json }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5200,
+        -848
+      ],
+      "id": "72678e3d-4966-4a50-ac90-104ff1a64de2",
+      "name": "Use Original Post"
+    },
+    {
+      "parameters": {
+        "jsCode": "const last = ($json.recent_posts || \"\").toLowerCase();\nconst patterns = [\"myth vs fact\",\"playbook\",\"q&a\",\"contrarian\",\"mini case study\",\"data-led insight\"];\nconst flags = {};\nfor (const p of patterns) flags[p] = last.includes(p);\nreturn [{ json: { ...$json, style_flags: flags } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        368,
+        -1104
+      ],
+      "id": "eb620c10-21d9-4070-b5ab-b93cd8f905da",
+      "name": "Build Style Signature"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Build Style Signature",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Basic LLM:Write Post",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract & Sanitize Sources": {
+      "main": [
+        [
+          {
+            "node": "Validate URL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate URL": {
+      "main": [
+        [
+          {
+            "node": "Merge Originals",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assemble Final Post": {
+      "main": [
+        [
+          {
+            "node": "Needs Repair?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Originals": {
+      "main": [
+        [
+          {
+            "node": "Assemble Final Post",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs Repair?": {
+      "main": [
+        [
+          {
+            "node": "Repair Sources (LLM)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model1": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Repair Sources (LLM)",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Repair Sources (LLM)": {
+      "main": [
+        [
+          {
+            "node": "Inject Repaired Sources",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Inject Repaired Sources": {
+      "main": [
+        [
+          {
+            "node": "Extract & Sanitize Sources (repair)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract & Sanitize Sources (repair)": {
+      "main": [
+        [
+          {
+            "node": "Validate URL (repair)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate URL (repair)": {
+      "main": [
+        [
+          {
+            "node": "Merge Originals (repair)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Originals (repair)": {
+      "main": [
+        [
+          {
+            "node": "Summarize Link Errors (repair)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assemble Final Post (repair)": {
+      "main": [
+        [
+          {
+            "node": "Repair Successful?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Repair Successful?": {
+      "main": [
+        [
+          {
+            "node": "Final Polish (dedupe)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Use Original Post",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model2": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Rewrite Failing Sources",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Summarize Link Errors (repair)": {
+      "main": [
+        [
+          {
+            "node": "Rewrite Failing Sources",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rewrite Failing Sources": {
+      "main": [
+        [
+          {
+            "node": "Apply Rewritten Bullets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply Rewritten Bullets": {
+      "main": [
+        [
+          {
+            "node": "Extract & Sanitize Sources (repair V2)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract & Sanitize Sources (repair V2)": {
+      "main": [
+        [
+          {
+            "node": "Validate URL (repairV2)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate URL (repairV2)": {
+      "main": [
+        [
+          {
+            "node": "Merge Originals (repairV2)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Originals (repairV2)": {
+      "main": [
+        [
+          {
+            "node": "Assemble Final Post (repair)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Basic LLM:Write Post": {
+      "main": [
+        [
+          {
+            "node": "Strip Inline Links (Body)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Strip Inline Links (Body)": {
+      "main": [
+        [
+          {
+            "node": "Extract & Sanitize Sources",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Final Polish (dedupe)": {
+      "main": [
+        [
+          {
+            "node": "Create a post",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Use Original Post": {
+      "main": [
+        [
+          {
+            "node": "Final Polish (dedupe)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Style Signature": {
+      "main": [
+        [
+          {
+            "node": "Basic LLM:Write Post",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "5312e97f-c50b-4d3f-ac71-5e4feec925bd",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "cee705cedf29f67c5a12442c17a27a2fcf7cf569b889e12eb28a9d18fe035b55"
+  },
+  "id": "pHBrgv6IZGDIwO21",
+  "tags": []
+}
